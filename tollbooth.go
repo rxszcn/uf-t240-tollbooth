@@ -6,11 +6,32 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/didip/tollbooth/v8/errors"
 	"github.com/didip/tollbooth/v8/libstring"
 	"github.com/didip/tollbooth/v8/limiter"
 )
+
+// ceilSeconds converts a duration into the integer number of seconds required
+// to cover it. A positive sub-second duration is rounded up to a full second so
+// that clients never retry before the bucket can actually accept a request.
+func ceilSeconds(d time.Duration) int64 {
+	if d <= 0 {
+		return 0
+	}
+	return int64((d + time.Second - 1) / time.Second)
+}
+
+// formatLimit renders the configured request-per-second quota without ever
+// collapsing a positive fractional quota into a semantic zero. Positive values
+// are rounded up (ceil); an explicitly disabled quota (max <= 0) reports zero.
+func formatLimit(max float64) string {
+	if max <= 0 {
+		return "0"
+	}
+	return fmt.Sprintf("%d", int64(math.Ceil(max)))
+}
 
 // setResponseHeaders configures X-Rate-Limit-Limit and X-Rate-Limit-Duration
 func setResponseHeaders(lmt *limiter.Limiter, w http.ResponseWriter, r *http.Request) {
@@ -25,12 +46,28 @@ func setResponseHeaders(lmt *limiter.Limiter, w http.ResponseWriter, r *http.Req
 	w.Header().Add("X-Rate-Limit-Request-Remote-Addr", r.RemoteAddr)
 }
 
-// setRateLimitResponseHeaders configures RateLimit-Limit, RateLimit-Remaining and RateLimit-Reset
-// as seen at https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers
-func setRateLimitResponseHeaders(lmt *limiter.Limiter, w http.ResponseWriter, tokensLeft int) {
-	w.Header().Add("RateLimit-Limit", fmt.Sprintf("%d", int(math.Round(lmt.GetMax()))))
-	w.Header().Add("RateLimit-Reset", "1")
-	w.Header().Add("RateLimit-Remaining", fmt.Sprintf("%d", tokensLeft))
+// setRateLimitResponseHeaders configures RateLimit-Limit, RateLimit-Remaining and
+// RateLimit-Reset as seen at
+// https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers.
+//
+// Every value is derived from the same atomic token-bucket decision (result), so
+// the advertised quota, remaining tokens and reset time always match the real
+// limiter state. RateLimit-Reset is expressed as delta-seconds until the bucket
+// is fully refilled. On a rejected request the matching Retry-After header (also
+// delta-seconds, rounded up) is emitted so clients know exactly how long to back
+// off before retrying.
+func setRateLimitResponseHeaders(lmt *limiter.Limiter, w http.ResponseWriter, result limiter.LimitResult) {
+	h := w.Header()
+	h.Set("RateLimit-Limit", formatLimit(lmt.GetMax()))
+	h.Set("RateLimit-Reset", fmt.Sprintf("%d", ceilSeconds(result.ResetDuration)))
+	h.Set("RateLimit-Remaining", fmt.Sprintf("%d", result.Remaining))
+
+	if result.Reached {
+		// Retry-After is only meaningful on rejection. It mirrors the real wait
+		// until the next token becomes available and is rounded up to a whole
+		// second to prevent premature retries.
+		h.Set("Retry-After", fmt.Sprintf("%d", ceilSeconds(result.RetryDelay)))
+	}
 }
 
 // NewLimiter is a convenience function to limiter.New.
@@ -48,13 +85,15 @@ func LimitByKeys(lmt *limiter.Limiter, keys []string) *errors.HTTPError {
 }
 
 // LimitByKeysAndReturn keeps track number of request made by keys separated by pipe.
-// It returns HTTPError when limit is exceeded, and also returns the current limit value.
-func LimitByKeysAndReturn(lmt *limiter.Limiter, keys []string) (*errors.HTTPError, int) {
-	if lmt.LimitReached(strings.Join(keys, "|")) {
-		return &errors.HTTPError{Message: lmt.GetMessage(), StatusCode: lmt.GetStatusCode()}, 0
+// It returns HTTPError when limit is exceeded, and also returns the full
+// token-bucket decision (remaining tokens, retry delay and reset duration).
+func LimitByKeysAndReturn(lmt *limiter.Limiter, keys []string) (*errors.HTTPError, limiter.LimitResult) {
+	result := lmt.LimitReachedReport(strings.Join(keys, "|"))
+	if result.Reached {
+		return &errors.HTTPError{Message: lmt.GetMessage(), StatusCode: lmt.GetStatusCode()}, result
 	}
 
-	return nil, lmt.Tokens(strings.Join(keys, "|"))
+	return nil, result
 }
 
 // ShouldSkipLimiter is a series of filter that decides if request should be limited or not.
@@ -299,24 +338,27 @@ func LimitByRequest(lmt *limiter.Limiter, w http.ResponseWriter, r *http.Request
 
 	sliceKeys := BuildKeys(lmt, r)
 
-	// Get the lowest value over all keys to return in headers.
-	// Start with high arbitrary number so that any limit returned would be lower and would
-	// overwrite the value we start with.
-	var tokensLeft = math.MaxInt32
+	// Aggregate the decisions over every key. On success the headers describe
+	// the most constrained bucket evaluated (lowest remaining token count); on
+	// rejection they describe the first bucket that actually denied the request,
+	// so Retry-After/Reset reflect the real reason for the rejection.
+	var worst limiter.LimitResult
+	haveDecision := false
 
 	// Loop sliceKeys and check if one of them has error.
 	for _, keys := range sliceKeys {
-		httpError, keysLimit := LimitByKeysAndReturn(lmt, keys)
-		if tokensLeft > keysLimit {
-			tokensLeft = keysLimit
+		httpError, result := LimitByKeysAndReturn(lmt, keys)
+		if !haveDecision || result.Remaining < worst.Remaining {
+			worst = result
+			haveDecision = true
 		}
 		if httpError != nil {
-			setRateLimitResponseHeaders(lmt, w, tokensLeft)
+			setRateLimitResponseHeaders(lmt, w, result)
 			return httpError
 		}
 	}
 
-	setRateLimitResponseHeaders(lmt, w, tokensLeft)
+	setRateLimitResponseHeaders(lmt, w, worst)
 	return nil
 }
 

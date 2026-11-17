@@ -580,7 +580,25 @@ func (l *Limiter) RemoveContextValuesEntries(contextValue string, entriesForRemo
 	return l
 }
 
-func (l *Limiter) limitReachedWithTokenBucketTTL(key string, tokenBucketTTL time.Duration) bool {
+// LimitResult describes the outcome of a single rate-limit decision for a key.
+// Every field is computed from one atomic token-bucket snapshot, therefore the
+// retry delay, reset duration and remaining tokens never contradict each other.
+type LimitResult struct {
+	// Reached is true when the request was rejected (no token was consumed).
+	Reached bool
+
+	// Remaining is the number of whole tokens left after the decision.
+	Remaining int
+
+	// RetryDelay is how long a rejected caller must wait before a new request
+	// can be accepted. It is zero when the request was allowed.
+	RetryDelay time.Duration
+
+	// ResetDuration is how long until the bucket is completely refilled.
+	ResetDuration time.Duration
+}
+
+func (l *Limiter) limitReachedWithTokenBucketTTL(key string, tokenBucketTTL time.Duration) LimitResult {
 	lmtMax := l.GetMax()
 	lmtBurst := l.GetBurst()
 	l.Lock()
@@ -596,14 +614,35 @@ func (l *Limiter) limitReachedWithTokenBucketTTL(key string, tokenBucketTTL time
 
 	expiringMap, found := l.tokenBuckets.Get(key)
 	if !found {
-		return false
+		// Without a bucket there is nothing enforcing a limit, so allow the
+		// request and report no waiting time.
+		return LimitResult{Reached: false}
 	}
 
-	return !expiringMap.Allow()
+	decision := expiringMap.AllowNReport(time.Now(), 1)
+	return LimitResult{
+		Reached:       !decision.Allowed,
+		Remaining:     decision.Remaining,
+		RetryDelay:    decision.RetryDelay,
+		ResetDuration: decision.ResetDuration,
+	}
 }
 
 // LimitReached returns a bool indicating if the Bucket identified by key ran out of tokens.
 func (l *Limiter) LimitReached(key string) bool {
+	ttl := l.GetTokenBucketExpirationTTL()
+
+	if ttl <= 0 {
+		ttl = l.generalExpirableOptions.DefaultExpirationTTL
+	}
+
+	return l.limitReachedWithTokenBucketTTL(key, ttl).Reached
+}
+
+// LimitReachedReport returns the full decision for the Bucket identified by key,
+// including the remaining tokens and the retry/reset durations measured against
+// the real token-bucket state.
+func (l *Limiter) LimitReachedReport(key string) LimitResult {
 	ttl := l.GetTokenBucketExpirationTTL()
 
 	if ttl <= 0 {

@@ -145,7 +145,7 @@ func main() {
 
 4. Upon rejection, the following HTTP response headers are available to users:
 
-    * `X-Rate-Limit-Limit` The maximum request limit.
+    * `X-Rate-Limit-Limit` The maximum request limit, formatted with two decimals.
 
     * `X-Rate-Limit-Duration` The rate-limiter duration.
 
@@ -153,13 +153,15 @@ func main() {
 
     * `X-Rate-Limit-Request-Remote-Addr` The rejected request `RemoteAddr`.
 
-   Upon both success and rejection [RateLimit](https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers) headers are sent:
+   Upon both success and rejection [RateLimit](https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers) headers are sent. Every value is computed from the same atomic token-bucket decision, so the headers always match the real limiter state:
 
-   * `RateLimit-Limit` The maximum request limit within the time window (1s).
+   * `RateLimit-Limit` The request quota, expressed as the smallest whole number of requests that is not lower than the configured per-second limit (rounded up). A positive fractional limit such as `0.1` req/s is therefore reported as `1`, never as a misleading zero.
 
-   * `RateLimit-Reset` The rate-limiter time window duration in seconds (always 1s).
+   * `RateLimit-Remaining` The whole tokens still available in the bucket after the decision.
 
-   * `RateLimit-Remaining` The remaining tokens.
+   * `RateLimit-Reset` The number of seconds until the bucket is completely refilled. It is a real, state-dependent value rather than a fixed window: with a `0.1` req/s limiter an empty bucket reports `10` seconds, not `1`.
+
+   * `Retry-After` Sent **only on rejection (HTTP 429)**. The number of seconds the client must wait before the next token becomes available, rounded up so a client never retries before the request can succeed. It matches the real token-bucket wait, e.g. `10` for a `0.1` req/s limiter and `1` for a `1` req/s limiter. Successful responses do not include this header.
 
 5. Customize your own message or function when limit is reached.
 

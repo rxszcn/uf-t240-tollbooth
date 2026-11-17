@@ -102,11 +102,116 @@ func (lim *Limiter) TokensAt(t time.Time) float64 {
 	return tokens
 }
 
+// retryDelayAt reports how long the caller must wait after a rejected request at
+// time t before at least one token becomes available again. It returns 0 when a
+// token is already available. It does not mutate the limiter.
+func (lim *Limiter) retryDelayAt(t time.Time) time.Duration {
+	if lim.limit == Inf {
+		return 0
+	}
+	_, _, tokens := lim.advance(t)
+	if tokens >= 1 {
+		return 0
+	}
+	// A fractional token is already accumulating; only the missing fraction has
+	// to be refilled before the next whole token becomes available.
+	return lim.limit.durationFromTokens(1 - tokens)
+}
+
+// resetDurationAt reports how long the caller must wait after time t until the
+// bucket is completely refilled (tokens == burst). It returns 0 when the bucket
+// is already full. It does not mutate the limiter.
+func (lim *Limiter) resetDurationAt(t time.Time) time.Duration {
+	if lim.limit == Inf {
+		return 0
+	}
+	_, _, tokens := lim.advance(t)
+	if tokens >= float64(lim.burst) {
+		return 0
+	}
+	missing := float64(lim.burst) - tokens
+	return lim.limit.durationFromTokens(missing)
+}
+
+// RetryDelay returns how long the caller must wait after a rejected request
+// before at least one token becomes available again. It returns 0 when a token
+// is already available. It does not consume a token and does not mutate the
+// limiter, so it is safe to call after Allow/AllowN returned false.
+func (lim *Limiter) RetryDelay() time.Duration {
+	lim.mu.Lock()
+	defer lim.mu.Unlock()
+	return lim.retryDelayAt(time.Now())
+}
+
+// ResetDuration returns how long the caller must wait until the bucket is
+// completely refilled (tokens == burst). It returns 0 when the bucket is
+// already full. It does not mutate the limiter.
+func (lim *Limiter) ResetDuration() time.Duration {
+	lim.mu.Lock()
+	defer lim.mu.Unlock()
+	return lim.resetDurationAt(time.Now())
+}
+
 // AllowN reports whether n events may happen at time now.
 // Use this method if you intend to drop / skip events that exceed the rate limit.
 // Otherwise use Reserve or Wait.
 func (lim *Limiter) AllowN(now time.Time, n int) bool {
 	return lim.reserveN(now, n, 0).ok
+}
+
+// Decision is the outcome of an AllowNReport call. All fields are derived from a
+// single, atomic limiter state, so the reported retry delay, reset duration and
+// remaining tokens always describe the same bucket state.
+type Decision struct {
+	// Allowed reports whether the request consumed a token.
+	Allowed bool
+
+	// Remaining is the number of whole tokens left in the bucket right after the
+	// decision (it can be zero while fractional tokens are still refilling).
+	Remaining int
+
+	// RetryDelay is how long the caller must wait before at least one token is
+	// available again. It is zero for an allowed request and always positive for
+	// a rejected one. It does not consume an extra token.
+	RetryDelay time.Duration
+
+	// ResetDuration is how long the caller must wait until the bucket is
+	// completely refilled (tokens == burst).
+	ResetDuration time.Duration
+}
+
+// AllowNReport is the reporting variant of AllowN. Besides the allow/deny
+// decision it atomically derives the remaining tokens, the retry delay a
+// rejected caller must wait and the time until the bucket is fully refilled, so
+// response headers can be populated from a single consistent state.
+func (lim *Limiter) AllowNReport(now time.Time, n int) Decision {
+	lim.mu.Lock()
+	defer lim.mu.Unlock()
+
+	r := lim.reserveNLocked(now, n, 0)
+
+	d := Decision{
+		Allowed:       r.ok,
+		ResetDuration: lim.resetDurationAt(now),
+	}
+	if !r.ok {
+		// A rejected reservation does not mutate the limiter, so the retry delay
+		// is computed against the untouched bucket state.
+		d.RetryDelay = lim.retryDelayAt(now)
+		d.Remaining = int(lim.advanceTokens(now))
+		return d
+	}
+
+	// The reservation already consumed the token and advanced the state.
+	d.Remaining = int(lim.advanceTokens(now))
+	return d
+}
+
+// advanceTokens returns the number of tokens available at time t. It is a
+// read-only helper that requires lim.mu to be held.
+func (lim *Limiter) advanceTokens(t time.Time) float64 {
+	_, _, tokens := lim.advance(t)
+	return tokens
 }
 
 // A Reservation holds information about events that are permitted by a Limiter to happen after a delay.
@@ -314,9 +419,15 @@ func (lim *Limiter) SetBurstAt(now time.Time, newBurst int) {
 // reserveN returns Reservation, not *Reservation, to avoid allocation in AllowN and WaitN.
 func (lim *Limiter) reserveN(now time.Time, n int, maxFutureReserve time.Duration) Reservation {
 	lim.mu.Lock()
+	defer lim.mu.Unlock()
+	return lim.reserveNLocked(now, n, maxFutureReserve)
+}
 
+// reserveNLocked contains the token-bucket decision logic of reserveN and
+// assumes lim.mu is already held. It lets reporting callers (AllowNReport)
+// derive extra state from the same locked snapshot without re-entrant locking.
+func (lim *Limiter) reserveNLocked(now time.Time, n int, maxFutureReserve time.Duration) Reservation {
 	if lim.limit == Inf {
-		lim.mu.Unlock()
 		return Reservation{
 			ok:        true,
 			lim:       lim,
@@ -359,7 +470,6 @@ func (lim *Limiter) reserveN(now time.Time, n int, maxFutureReserve time.Duratio
 		lim.last = last
 	}
 
-	lim.mu.Unlock()
 	return r
 }
 

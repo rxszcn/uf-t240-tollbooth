@@ -398,7 +398,8 @@ func TestLimitHandler(t *testing.T) {
 	if status := rr.Code; status != http.StatusOK {
 		t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
 	}
-	// check RateLimit headers
+	// check RateLimit headers. After consuming the only token the burst-1 bucket
+	// is empty, so the real time to a full refill is 1s (not a hard-coded window).
 	if value := rr.Result().Header[http.CanonicalHeaderKey("RateLimit-Limit")]; len(value) < 1 || value[0] != "1" {
 		t.Errorf("handler returned wrong value: got %s want %s", value, "1")
 	}
@@ -407,6 +408,10 @@ func TestLimitHandler(t *testing.T) {
 	}
 	if value := rr.Result().Header[http.CanonicalHeaderKey("RateLimit-Remaining")]; len(value) < 1 || value[0] != "0" {
 		t.Errorf("handler returned wrong value: got %s want %s", value, "0")
+	}
+	// Retry-After is only emitted on rejection.
+	if value := rr.Result().Header[http.CanonicalHeaderKey("Retry-After")]; len(value) != 0 {
+		t.Errorf("successful response must not carry Retry-After, got %s", value)
 	}
 
 	ch := make(chan int)
@@ -431,11 +436,17 @@ func TestLimitHandler(t *testing.T) {
 		if value := rr.Result().Header[http.CanonicalHeaderKey("RateLimit-Limit")]; len(value) < 1 || value[0] != "1" {
 			t.Errorf("RateLimit-Limit has wrong value: got %s want %v", value, "1")
 		}
+		// Reset is the real refill time of the empty bucket (1s for 1 req/s).
 		if value := rr.Result().Header[http.CanonicalHeaderKey("RateLimit-Reset")]; len(value) < 1 || value[0] != "1" {
 			t.Errorf("RateLimit-Reset has wrong value: got %s want %v", value, "1")
 		}
 		if value := rr.Result().Header[http.CanonicalHeaderKey("RateLimit-Remaining")]; len(value) < 1 || value[0] != "0" {
 			t.Errorf("RateLimit-Remaining has wrong value: got %s want %v", value, "0")
+		}
+		// A 429 must always tell the client how long to back off. For a 1 req/s
+		// bucket the real wait until the next token is 1s.
+		if value := rr.Result().Header[http.CanonicalHeaderKey("Retry-After")]; len(value) < 1 || value[0] != "1" {
+			t.Errorf("Retry-After must be present on 429 and match the real 1s wait, got %s", value)
 		}
 		// OnLimitReached should be called
 		if counter != 1 {
@@ -596,7 +607,8 @@ func TestLimitHandlerEmptyHeader(t *testing.T) {
 		if status := rr.Code; status != http.StatusOK {
 			t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
 		}
-		// check RateLimit headers
+		// check RateLimit headers; the burst-1 bucket is now empty so its real
+		// full-refill time is 1s.
 		if value := rr.Result().Header[http.CanonicalHeaderKey("RateLimit-Limit")]; len(value) < 1 || value[0] != "1" {
 			t.Errorf("handler returned wrong value: got %s want %s", value, "1")
 		}
@@ -605,6 +617,10 @@ func TestLimitHandlerEmptyHeader(t *testing.T) {
 		}
 		if value := rr.Result().Header[http.CanonicalHeaderKey("RateLimit-Remaining")]; len(value) < 1 || value[0] != "0" {
 			t.Errorf("handler returned wrong value: got %s want %s", value, "0")
+		}
+		// Retry-After is only emitted on rejection.
+		if value := rr.Result().Header[http.CanonicalHeaderKey("Retry-After")]; len(value) != 0 {
+			t.Errorf("successful response must not carry Retry-After, got %s", value)
 		}
 	}
 
@@ -636,11 +652,16 @@ func TestLimitHandlerEmptyHeader(t *testing.T) {
 			if value := rr.Result().Header[http.CanonicalHeaderKey("RateLimit-Limit")]; len(value) < 1 || value[0] != "1" {
 				t.Errorf("RateLimit-Limit has wrong value: got %s want %v", value, "1")
 			}
+			// Reset reflects the real refill time of the empty bucket (1s).
 			if value := rr.Result().Header[http.CanonicalHeaderKey("RateLimit-Reset")]; len(value) < 1 || value[0] != "1" {
 				t.Errorf("RateLimit-Reset has wrong value: got %s want %v", value, "1")
 			}
 			if value := rr.Result().Header[http.CanonicalHeaderKey("RateLimit-Remaining")]; len(value) < 1 || value[0] != "0" {
 				t.Errorf("RateLimit-Remaining has wrong value: got %s want %v", value, "0")
+			}
+			// Every 429 must carry a backoff hint matching the real wait.
+			if value := rr.Result().Header[http.CanonicalHeaderKey("Retry-After")]; len(value) < 1 || value[0] != "1" {
+				t.Errorf("Retry-After must be present on 429 and match the real 1s wait, got %s", value)
 			}
 			// OnLimitReached should be called
 			if aint, ok := counterMap.Get(req1.Header.Get("user_id")); ok {
